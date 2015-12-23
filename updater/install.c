@@ -45,12 +45,8 @@
 #include "mtdutils/mounts.h"
 #include "mtdutils/mtdutils.h"
 #include "updater.h"
-#include "applypatch/applypatch.h"
-#include "flashutils/flashutils.h"
 #include "install.h"
-#ifdef HAVE_LIBTUNE2FS
 #include "tune2fs.h"
-#endif
 
 #ifdef USE_EXT4
 #include "make_ext4fs.h"
@@ -935,6 +931,74 @@ Value* GetPropFn(const char* name, State* state, int argc, Expr* argv[]) {
     return StringValue(strdup(value));
 }
 
+//Check to confirm if this is the same hardware as the one the package was
+//generated on or not. 32 vs 64 bit variants are upgrade compatible but have
+//names such as msmWXYZ msmWXYZ_32 vs msmWXYZ_64.Input to this
+//function is the BuildProp value that gets stored in the update package
+//at the time it it created.
+Value* ConfirmDevVariant(const char* name, State* state, int argc, Expr* argv[])
+{
+    //ro.product.device that was on the build that the update package was made
+    //from
+    char* package_dev_variant;
+    //ro.product.device on the current hardware
+    char current_dev_variant[PROPERTY_VALUE_MAX];
+    int comparison_len;
+    int package_dev_variant_len;
+    int current_dev_variant_len;
+    if (argc != 1) {
+        return ErrorAbort(state, "%s() expects 1 arg, got %d", name, argc);
+    }
+    package_dev_variant = Evaluate(state, argv[0]);
+    if (!package_dev_variant) goto error;
+    property_get("ro.product.device", current_dev_variant, "n/a");
+    if (!strncmp(current_dev_variant,"n/a",3)) {
+        ErrorAbort(state, "Failed to get valid ro.product.device");
+        goto error;
+    }
+    package_dev_variant_len = strlen(package_dev_variant);
+    current_dev_variant_len = strlen(current_dev_variant);
+    //Ensure device variant lengths are atleast 3 characters long
+    if ((package_dev_variant_len < 3) || (current_dev_variant_len < 3)) {
+        ErrorAbort(state, "Device Variant length is less than 3 characters");
+        goto error;
+    }
+    //Length of the largest string - 3(for _32/64)
+    comparison_len =
+        (package_dev_variant_len >= current_dev_variant_len ?
+        package_dev_variant_len :
+        current_dev_variant_len) - 3;
+    //Complete match
+    if (!strncmp(current_dev_variant, package_dev_variant,
+                 strlen(current_dev_variant)))
+        goto success;
+    //Match except for the last 3 char's of either string which are _32 or _64
+    if (!strncmp(current_dev_variant, package_dev_variant, comparison_len)) {
+        if (package_dev_variant_len >= current_dev_variant_len) {
+            if (!strncmp(&package_dev_variant[package_dev_variant_len-3],
+                         "_32", 3) ||
+                !strncmp(&package_dev_variant[package_dev_variant_len-3],
+                         "_64", 3))
+                goto success;
+        } else {
+            if (!strncmp(&current_dev_variant[current_dev_variant_len-3],
+                         "_32", 3) ||
+                !strncmp(&current_dev_variant[current_dev_variant_len-3],
+                         "_64", 3))
+                goto success;
+        }
+        ErrorAbort(state, "Invalid target for update package");
+        goto error;
+    }
+success:
+    free(package_dev_variant);
+    return StringValue(strdup("OK"));
+error:
+    if (package_dev_variant) {
+        free(package_dev_variant);
+    }
+    return StringValue(strdup("ERROR"));
+}
 
 // file_getprop(file, key)
 //
@@ -1066,13 +1130,65 @@ Value* WriteRawImageFn(const char* name, State* state, int argc, Expr* argv[]) {
         goto done;
     }
 
-    char* filename = contents->data;
-    if (0 == restore_raw_partition(NULL, partition, filename))
-        result = strdup(partition);
-    else {
+    mtd_scan_partitions();
+    const MtdPartition* mtd = mtd_find_partition_by_name(partition);
+    if (mtd == NULL) {
+        printf("%s: no mtd partition named \"%s\"\n", name, partition);
         result = strdup("");
         goto done;
     }
+
+    MtdWriteContext* ctx = mtd_write_partition(mtd);
+    if (ctx == NULL) {
+        printf("%s: can't write mtd partition \"%s\"\n",
+                name, partition);
+        result = strdup("");
+        goto done;
+    }
+
+    bool success;
+
+    if (contents->type == VAL_STRING) {
+        // we're given a filename as the contents
+        char* filename = contents->data;
+        FILE* f = fopen(filename, "rb");
+        if (f == NULL) {
+            printf("%s: can't open %s: %s\n",
+                    name, filename, strerror(errno));
+            result = strdup("");
+            goto done;
+        }
+
+        success = true;
+        char* buffer = malloc(BUFSIZ);
+        int read;
+        while (success && (read = fread(buffer, 1, BUFSIZ, f)) > 0) {
+            int wrote = mtd_write_data(ctx, buffer, read);
+            success = success && (wrote == read);
+        }
+        free(buffer);
+        fclose(f);
+    } else {
+        // we're given a blob as the contents
+        ssize_t wrote = mtd_write_data(ctx, contents->data, contents->size);
+        success = (wrote == contents->size);
+    }
+    if (!success) {
+        printf("mtd_write_data to %s failed: %s\n",
+                partition, strerror(errno));
+    }
+
+    if (mtd_erase_blocks(ctx, -1) == -1) {
+        printf("%s: error erasing blocks of %s\n", name, partition);
+    }
+    if (mtd_write_close(ctx) != 0) {
+        printf("%s: error closing write of %s\n", name, partition);
+    }
+
+    printf("%s %s partition\n",
+           success ? "wrote" : "failed to write", partition);
+
+    result = success ? partition : strdup("");
 
 done:
     if (result != partition) FreeValue(partition_value);
@@ -1493,7 +1609,6 @@ Value* EnableRebootFn(const char* name, State* state, int argc, Expr* argv[]) {
 }
 
 Value* Tune2FsFn(const char* name, State* state, int argc, Expr* argv[]) {
-#ifdef HAVE_LIBTUNE2FS
     if (argc == 0) {
         return ErrorAbort(state, "%s() expects args, got %d", name, argc);
     }
@@ -1522,9 +1637,6 @@ Value* Tune2FsFn(const char* name, State* state, int argc, Expr* argv[]) {
         return ErrorAbort(state, "%s() returned error code %d", name, result);
     }
     return StringValue(strdup("t"));
-#else
-    return ErrorAbort(state, "%s() support not present, no libtune2fs", name);
-#endif // HAVE_LIBTUNE2FS
 }
 
 void RegisterInstallFunctions() {
@@ -1578,4 +1690,5 @@ void RegisterInstallFunctions() {
 
     RegisterFunction("enable_reboot", EnableRebootFn);
     RegisterFunction("tune2fs", Tune2FsFn);
+    RegisterFunction("get_device_compatible", ConfirmDevVariant);
 }
